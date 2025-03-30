@@ -1,0 +1,23 @@
+#!/bin/bash
+
+set -e
+
+MN_STRATUM_DOCKER_NAME=${MN_STRATUM_DOCKER_NAME:-mn-stratum}
+HOST_NAME=$1
+
+# Try using ip netns exec (if namespaces exist)
+if docker exec "$MN_STRATUM_DOCKER_NAME" ip netns list | grep -q "$HOST_NAME"; then
+  docker exec -it "$MN_STRATUM_DOCKER_NAME" ip netns exec "$HOST_NAME" bash
+  exit 0
+fi
+
+# Otherwise, fallback to using mnexec with the host's PID
+PID=$(docker exec "$MN_STRATUM_DOCKER_NAME" \
+  bash -c "ps -ef | grep 'mininet:$HOST_NAME' | grep -v grep | awk '{print \$2}'")
+
+if [ -z "$PID" ]; then
+  echo "❌ Error: Could not find process for host '$HOST_NAME'"
+  exit 1
+fi
+
+docker exec -it "$MN_STRATUM_DOCKER_NAME" mnexec -a "$PID" bash
