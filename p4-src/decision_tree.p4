@@ -10,7 +10,6 @@ const bit<8> TCP_FIN_MASK = 0x01;
 const bit<8> TCP_SYN_MASK = 0x02;
     
 
-
 /*************************************************************************
 *********************** H E A D E R S  ***********************************
 *************************************************************************/
@@ -157,9 +156,74 @@ control MyIngress(inout headers hdr,
     // register definition
     register<bit<32>>(NUM_REGISTERS) pkt_count;
     register<bit<32>>(NUM_REGISTERS) byte_count;
+    register<bit<32>>(NUM_REGISTERS) avg_pkt_size;
+    register<bit<48>>(NUM_REGISTERS) avg_iat;
+
     register<bit<48>>(NUM_REGISTERS) first_pkt_ts;
     register<bit<48>>(NUM_REGISTERS) prev_pkt_ts;
-    register<bit<48>>(NUM_REGISTERS) iats;
+
+    action compute_flow_id() {
+        bit<32> hash_out;
+        hash(hash_out,
+            HashAlgorithm.crc32,
+            (bit<32>)0x0,
+            {
+                meta.src_addr,
+                meta.dst_addr,
+                (bit<32>)meta.src_port,
+                (bit<32>)meta.dst_port,
+                (bit<32>)hdr.ipv4.protocol
+            },
+            (bit<32>)0xFFFFFFFF);
+
+        // use only 10 LSB bits
+        meta.flow_id = hash_out[9:0];
+    }
+
+    action store_pkts_and_bytes_count() {
+        pkt_count.read(meta.pkt_count, (bit<32>)meta.flow_id);
+        byte_count.read(meta.byte_count, (bit<32>)meta.flow_id);
+        
+        meta.pkt_count = meta.pkt_count + 1;
+        meta.byte_count = meta.byte_count + standard_metadata.packet_length;
+        //meta.avg_pkt_size = meta.byte_count / meta.pkt_count;
+
+        pkt_count.write((bit<32>)meta.flow_id, meta.pkt_count);
+        byte_count.write((bit<32>)meta.flow_id, meta.byte_count);
+    }
+
+    action compute_avg_pkt_size() {
+        avg_pkt_size.read(meta.avg_pkt_size, (bit<32>)meta.flow_id);
+        meta.avg_pkt_size = (meta.avg_pkt_size  >> 4) + standard_metadata.packet_length;
+
+        avg_pkt_size.write((bit<32>)meta.flow_id, meta.avg_pkt_size);
+    }
+
+    action store_first_pkt_ts() {
+        first_pkt_ts.write((bit<32>)meta.flow_id, standard_metadata.ingress_global_timestamp);
+        prev_pkt_ts.write((bit<32>)meta.flow_id, standard_metadata.ingress_global_timestamp);
+    }
+    
+    action compute_flow_duration() {
+        bit<48> pkt_ts; 
+        bit<48> duration;
+        first_pkt_ts.read(pkt_ts, (bit<32>)meta.flow_id);
+        duration = (standard_metadata.ingress_global_timestamp - pkt_ts) >> 20;        // convert to milliseconds
+
+        meta.duration = (bit<32>)duration;
+    }
+    
+    action compute_iat() {
+        bit<48> prev_ts;
+        bit<48> iat;
+        avg_iat.read(iat, (bit<32>)meta.flow_id);
+        prev_pkt_ts.read(prev_ts, (bit<32>)meta.flow_id);
+        iat = (iat >> 4) + ((standard_metadata.ingress_global_timestamp - prev_ts) >> 2);
+
+        meta.avg_iat = iat[31:0];                                                    // take only LSB bits
+        avg_iat.write((bit<32>)meta.flow_id, iat);
+        prev_pkt_ts.write((bit<32>)meta.flow_id, standard_metadata.ingress_global_timestamp);
+    }
 
     action write_result(bit<8> result) {
         meta.result = result;
@@ -172,7 +236,6 @@ control MyIngress(inout headers hdr,
             meta.avg_pkt_size: exact;
             // meta.duration: exact;
             meta.avg_iat: exact;
-            // hdr.tcp.flags: exact;
         }
         actions = {
             write_result;
@@ -180,42 +243,6 @@ control MyIngress(inout headers hdr,
         }
         size = 1024;
         default_action = NoAction();
-    }
-
-    action compute_flow_id() {
-        // here we assume no collisions
-        meta.flow_id =(bit<10>)((meta.src_addr) ^ (meta.dst_addr) 
-                         ^ (bit<32>)(meta.src_port) ^ (bit<32>)(meta.dst_port)
-                         ^ (bit<32>)hdr.ipv4.protocol);
-    }
-    
-    action store_first_pkt_ts() {
-        first_pkt_ts.write((bit<32>)meta.flow_id, standard_metadata.ingress_global_timestamp);
-        prev_pkt_ts.write((bit<32>)meta.flow_id, standard_metadata.ingress_global_timestamp);
-    }
-    
-    action compute_flow_duration() {
-        bit<48> pkt_ts; 
-        first_pkt_ts.read(pkt_ts, (bit<32>)meta.flow_id);
-        meta.duration = (bit<32>)(standard_metadata.ingress_global_timestamp - pkt_ts);
-    }
-
-    action compute_and_store_iats() {
-        bit<48> ia_times; 
-        bit<48> pkt_ts; 
-
-        iats.read(ia_times, (bit<32>)meta.flow_id);
-        prev_pkt_ts.read(pkt_ts, (bit<32>)meta.flow_id);
-        ia_times = ia_times + (standard_metadata.ingress_global_timestamp - pkt_ts);
-
-        iats.write((bit<32>)meta.flow_id, ia_times);
-        prev_pkt_ts.write((bit<32>)meta.flow_id, standard_metadata.ingress_global_timestamp);
-    }
-
-    action compute_avg_iat() {
-        bit<48> ia_times; 
-        iats.read(ia_times, (bit<32>)meta.flow_id);
-        //meta.avg_iat = (bit<32>)(ia_times / ((bit<48>)(meta.pkt_count - 1))); 
     }
 
     action send_digest_msg() {
@@ -239,65 +266,57 @@ control MyIngress(inout headers hdr,
 
     apply {
 
-        // initialize
-        meta.apply_classifier = 0;
-        meta.result = 0; 
-        pkt_count.read(meta.pkt_count, (bit<32>)meta.flow_id);
-        byte_count.read(meta.byte_count, (bit<32>)meta.flow_id);
-        
-        // update flow table registers
-        meta.pkt_count = meta.pkt_count + 1;
-        meta.byte_count = meta.byte_count + standard_metadata.packet_length;
-        //meta.avg_pkt_size = meta.byte_count / meta.pkt_count;
-
-        // write back registers
-        pkt_count.write((bit<32>)meta.flow_id, meta.pkt_count);
-        byte_count.write((bit<32>)meta.flow_id, meta.byte_count);
-
         if (hdr.ipv4.isValid()) {
-            // copy layer 3 addresses to metadata
+
             meta.src_addr = hdr.ipv4.srcAddr;
             meta.dst_addr = hdr.ipv4.dstAddr;
 
             // process TCP 
             if (hdr.tcp.isValid()) {
+
                 meta.src_port = hdr.tcp.srcPort;
                 meta.dst_port = hdr.tcp.dstPort;
                 
-                // get flow_id            
                 compute_flow_id();
 
-                // update flow table 
-                if ((hdr.tcp.flags & TCP_SYN_MASK) == 1) {    // first packet 
+                store_pkts_and_bytes_count();
+
+                compute_avg_pkt_size();
+
+                if ((hdr.tcp.flags & TCP_SYN_MASK) == 1) {           // first packet 
                     store_first_pkt_ts();
                 } else if ((hdr.tcp.flags & TCP_FIN_MASK) == 1) {    // last packet
                     compute_flow_duration();
-                    compute_avg_iat();
+                    compute_iat();
                     meta.apply_classifier = 1;
-                } else {    // all other packets
-                    compute_and_store_iats();
+                } else {                                             // all other packets
+                    compute_iat();
                 }
             }
 
             // process UDP
             if (hdr.udp.isValid()) {
+
                 meta.src_port = hdr.udp.srcPort;
                 meta.dst_port = hdr.udp.dstPort;
                 
-                // get flow_id            
                 compute_flow_id();
+                
+                store_pkts_and_bytes_count();
+                
+                compute_avg_pkt_size();
 
-                if (meta.pkt_count == 1) {    // first packet 
+                if (meta.pkt_count == 1) {                            // first packet 
                     store_first_pkt_ts();
-                } else {    // all other packets
+                } else {                                              // all other packets
+
                     // since there is no way to know the last packet in udp flows
                     // update flow features for all intermediate packets and run 
                     // classifier for all packets. However, a sampling based
                     // approch can also be implemented here.
 
                     compute_flow_duration();
-                    compute_and_store_iats();
-                    compute_avg_iat();
+                    compute_iat();
                     meta.apply_classifier = 1;
                 }
             }

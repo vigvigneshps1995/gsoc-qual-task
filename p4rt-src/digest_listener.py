@@ -72,7 +72,7 @@ if __name__ == '__main__':
                 dst_port = get_int(members[3].bitstring)
                 proto = get_proto(members[4].bitstring)
                 result = get_int(members[5].bitstring)
-                #print("src_add: %s, dst_addr: %s, src_port: %d, dst_port: %d, proto: %s -> result: %d" % (src_addr, dst_addr, src_port, dst_port, proto, result))
+                print("src_add: %s, dst_addr: %s, src_port: %d, dst_port: %d, proto: %s -> result: %d" % (src_addr, dst_addr, src_port, dst_port, proto, result))
 
 
                 pkts = get_int(members[6].bitstring)
@@ -82,6 +82,8 @@ if __name__ == '__main__':
                 iat = get_int(members[10].bitstring)
                 flow_id = get_int(members[11].bitstring)
                 print("flow-id:%d,  pkts: %d, bytes: %d, pkt_size: %d, duration: %d, IAT: %d" % (flow_id, pkts, _bytes, pkt_size, duration, iat))
+                print()
+
     except KeyboardInterrupt:
         print("Exiting...")
         p4sh.teardown()
