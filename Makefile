@@ -57,7 +57,6 @@ controller-logs:
 host:
 	$(SCRIPTS)/utils/mn-stratum/exec $(name)
 
-
 clean: .p4rt-clean .p4-clean
 
 ####################################################################
@@ -67,6 +66,11 @@ clean: .p4rt-clean .p4-clean
 	P4_PROGRAM_NAME=decision_tree \
 	P4RT_PROGRAM_NAME=decision_tree \
 	make .p4rt-script
+
+.controller-digest-listener:
+	P4RT_PROGRAM_NAME=digest_listener \
+	make .p4rt-script-exec
+
 ####################################################################
 # P4 Runtime 
 ####################################################################
@@ -85,6 +89,11 @@ clean: .p4rt-clean .p4-clean
 	P4RUNTIME_SH_DOCKER_NAME=p4runtime-sh-$(grpc_port) \
 	$(SCRIPTS)/p4runtime-sh.run-script \
 		"p4rt-src/$(P4RT_PROGRAM_DIRNAME)/$(P4RT_PROGRAM_NAME).py --grpc-port=$(grpc_port) --topo-config=topo/$(topo).json"
+
+.p4rt-script-exec:
+	P4RUNTIME_SH_DOCKER_NAME=p4runtime-sh-$(grpc_port) \
+	$(SCRIPTS)/p4runtime-sh.exec \
+		"python3 p4rt-src/$(P4RT_PROGRAM_DIRNAME)/$(P4RT_PROGRAM_NAME).py --grpc-port=$(grpc_port)"
 
 .p4rt-logs:
 	cat logs/$(P4_PROGRAM_DIRNAME)/$(P4_PROGRAM_NAME)-$(grpc_port)-table.json

@@ -1,0 +1,8 @@
+#!/bin/bash
+
+P4RUNTIME_SH_DOCKER_NAME=${P4RUNTIME_SH_DOCKER_NAME:-p4runtime-sh}
+P4RUNTIME_SH_MOUNT_DIR=${P4RUNTIME_SH_MOUNT_DIR:-${PWD}}
+
+docker exec -it -w /workdir $P4RUNTIME_SH_DOCKER_NAME bash -c \
+  "source /p4runtime-sh/venv/bin/activate && \
+   export PYTHONPATH=/p4runtime-sh/utils:\$PYTHONPATH && $@"

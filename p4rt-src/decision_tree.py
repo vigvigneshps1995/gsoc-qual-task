@@ -67,7 +67,7 @@ if __name__ == '__main__':
                 table_entry.match[f"meta.{field}"] = str(val)
 
 
-            table_entry.match["hdr.tcp.flags"] = "0x01"  # Match on FIN
+            #table_entry.match["hdr.tcp.flags"] = "0x01"  # Match on FIN
             table_entry.action["result"] = str(rule["result"])
             table_entry.insert()
 

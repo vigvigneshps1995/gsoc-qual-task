@@ -6,6 +6,9 @@
 #define KEY_SIZE 32
 #define NUM_REGISTERS 1024
 const bit<16> TYPE_IPV4 = 0x800;
+const bit<8> TCP_FIN_MASK = 0x01;
+const bit<8> TCP_SYN_MASK = 0x02;
+    
 
 
 /*************************************************************************
@@ -67,8 +70,24 @@ struct metadata {
     bit<32> dst_addr;
     bit<16> src_port;
     bit<16> dst_port;
-    bit<32> pkt_index;
+    bit<10> flow_id;
     bit<8>  result;
+    bit<1>  apply_classifier;
+}
+
+struct digest_msg {
+    bit<32> src_addr;
+    bit<32> dst_addr;
+    bit<16> src_port;
+    bit<16> dst_port;
+    bit<8>  protocol;
+    bit<8>  result;
+    bit<32> pkt_count;
+    bit<32> byte_count;
+    bit<32> avg_pkt_size;
+    bit<32> duration;
+    bit<32> avg_iat;
+    bit<10> flow_id;
 }
 
 struct headers {
@@ -135,9 +154,12 @@ control MyIngress(inout headers hdr,
                   inout metadata meta,
                   inout standard_metadata_t standard_metadata) {
 
-    // Sample register definition
+    // register definition
     register<bit<32>>(NUM_REGISTERS) pkt_count;
-    // TODO: Populate the other registers here
+    register<bit<32>>(NUM_REGISTERS) byte_count;
+    register<bit<48>>(NUM_REGISTERS) first_pkt_ts;
+    register<bit<48>>(NUM_REGISTERS) prev_pkt_ts;
+    register<bit<48>>(NUM_REGISTERS) iats;
 
     action write_result(bit<8> result) {
         meta.result = result;
@@ -150,7 +172,7 @@ control MyIngress(inout headers hdr,
             meta.avg_pkt_size: exact;
             // meta.duration: exact;
             meta.avg_iat: exact;
-            hdr.tcp.flags: exact;
+            // hdr.tcp.flags: exact;
         }
         actions = {
             write_result;
@@ -160,23 +182,131 @@ control MyIngress(inout headers hdr,
         default_action = NoAction();
     }
 
+    action compute_flow_id() {
+        // here we assume no collisions
+        meta.flow_id =(bit<10>)((meta.src_addr) ^ (meta.dst_addr) 
+                         ^ (bit<32>)(meta.src_port) ^ (bit<32>)(meta.dst_port)
+                         ^ (bit<32>)hdr.ipv4.protocol);
+    }
+    
+    action store_first_pkt_ts() {
+        first_pkt_ts.write((bit<32>)meta.flow_id, standard_metadata.ingress_global_timestamp);
+        prev_pkt_ts.write((bit<32>)meta.flow_id, standard_metadata.ingress_global_timestamp);
+    }
+    
+    action compute_flow_duration() {
+        bit<48> pkt_ts; 
+        first_pkt_ts.read(pkt_ts, (bit<32>)meta.flow_id);
+        meta.duration = (bit<32>)(standard_metadata.ingress_global_timestamp - pkt_ts);
+    }
+
+    action compute_and_store_iats() {
+        bit<48> ia_times; 
+        bit<48> pkt_ts; 
+
+        iats.read(ia_times, (bit<32>)meta.flow_id);
+        prev_pkt_ts.read(pkt_ts, (bit<32>)meta.flow_id);
+        ia_times = ia_times + (standard_metadata.ingress_global_timestamp - pkt_ts);
+
+        iats.write((bit<32>)meta.flow_id, ia_times);
+        prev_pkt_ts.write((bit<32>)meta.flow_id, standard_metadata.ingress_global_timestamp);
+    }
+
+    action compute_avg_iat() {
+        bit<48> ia_times; 
+        iats.read(ia_times, (bit<32>)meta.flow_id);
+        //meta.avg_iat = (bit<32>)(ia_times / ((bit<48>)(meta.pkt_count - 1))); 
+    }
+
+    action send_digest_msg() {
+        digest_msg msg;
+        msg.src_addr = meta.src_addr;
+        msg.dst_addr = meta.dst_addr;
+        msg.src_port = meta.src_port;
+        msg.dst_port = meta.dst_port;
+        msg.protocol = hdr.ipv4.protocol;
+        msg.result = meta.result;
+
+        msg.pkt_count =  meta.pkt_count;
+        msg.byte_count = meta.byte_count;
+        msg.avg_pkt_size = meta.avg_pkt_size;
+        msg.duration = meta.duration;
+        msg.avg_iat = meta.avg_iat;
+        msg.flow_id = meta.flow_id;
+
+        digest<digest_msg>(1, msg);
+    }
+
     apply {
-        // Extract the pkt index
-        meta.pkt_index = (bit<32>)standard_metadata.ingress_port;
 
-        // Read current value into meta.pkt_val
-        pkt_count.read(meta.pkt_count, meta.pkt_index);
-
-        // Increment in-place
+        // initialize
+        meta.apply_classifier = 0;
+        meta.result = 0; 
+        pkt_count.read(meta.pkt_count, (bit<32>)meta.flow_id);
+        byte_count.read(meta.byte_count, (bit<32>)meta.flow_id);
+        
+        // update flow table registers
         meta.pkt_count = meta.pkt_count + 1;
+        meta.byte_count = meta.byte_count + standard_metadata.packet_length;
+        //meta.avg_pkt_size = meta.byte_count / meta.pkt_count;
 
-        // Write back
-        pkt_count.write(meta.pkt_index, meta.pkt_count);
+        // write back registers
+        pkt_count.write((bit<32>)meta.flow_id, meta.pkt_count);
+        byte_count.write((bit<32>)meta.flow_id, meta.byte_count);
 
-        // TODO: Implement the rest of the register operations here
+        if (hdr.ipv4.isValid()) {
+            // copy layer 3 addresses to metadata
+            meta.src_addr = hdr.ipv4.srcAddr;
+            meta.dst_addr = hdr.ipv4.dstAddr;
 
-        // Apply the classifier
-        classifier.apply();
+            // process TCP 
+            if (hdr.tcp.isValid()) {
+                meta.src_port = hdr.tcp.srcPort;
+                meta.dst_port = hdr.tcp.dstPort;
+                
+                // get flow_id            
+                compute_flow_id();
+
+                // update flow table 
+                if ((hdr.tcp.flags & TCP_SYN_MASK) == 1) {    // first packet 
+                    store_first_pkt_ts();
+                } else if ((hdr.tcp.flags & TCP_FIN_MASK) == 1) {    // last packet
+                    compute_flow_duration();
+                    compute_avg_iat();
+                    meta.apply_classifier = 1;
+                } else {    // all other packets
+                    compute_and_store_iats();
+                }
+            }
+
+            // process UDP
+            if (hdr.udp.isValid()) {
+                meta.src_port = hdr.udp.srcPort;
+                meta.dst_port = hdr.udp.dstPort;
+                
+                // get flow_id            
+                compute_flow_id();
+
+                if (meta.pkt_count == 1) {    // first packet 
+                    store_first_pkt_ts();
+                } else {    // all other packets
+                    // since there is no way to know the last packet in udp flows
+                    // update flow features for all intermediate packets and run 
+                    // classifier for all packets. However, a sampling based
+                    // approch can also be implemented here.
+
+                    compute_flow_duration();
+                    compute_and_store_iats();
+                    compute_avg_iat();
+                    meta.apply_classifier = 1;
+                }
+            }
+        }
+
+        if (meta.apply_classifier == 1) {
+            classifier.apply();
+            send_digest_msg();
+        }
     }
 }
 
